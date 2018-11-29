@@ -6,6 +6,9 @@
 #include <unordered_map>
 #include <boost/any.hpp>
 
+//------------------------------------------------------------------------------
+// CONSTEXPR CRC64
+//------------------------------------------------------------------------------
 static constexpr const uint64_t crc64_tab[256] = {
         UINT64_C(0x0000000000000000), UINT64_C(0x7ad870c830358979),
         UINT64_C(0xf5b0e190606b12f2), UINT64_C(0x8f689158505e9b8b),
@@ -137,26 +140,26 @@ static constexpr const uint64_t crc64_tab[256] = {
         UINT64_C(0x536fa08fdfd90e51), UINT64_C(0x29b7d047efec8728),
 };
 
+//------------------------------------------------------------------------------
 constexpr uint64_t const_crc64(const char* str)
 {
     uint64_t ret = 0;
     for (uint64_t j = 0; str[j] != '\0'; j++) {
-        uint8_t byte = str[j];
-        ret = crc64_tab[(uint8_t)ret ^ byte] ^ (ret >> 8);
+        uint8_t byte = static_cast<uint8_t>(str[j]);
+        ret = crc64_tab[static_cast<uint8_t>(ret) ^ byte] ^ (ret >> 8);
     }
     return ret;
 }
 
+//------------------------------------------------------------------------------
 constexpr uint64_t operator"" _crc64(const char* str, size_t)
 {
     return const_crc64(str);
 }
 
-struct any_container
-{
-
-};
-
+//------------------------------------------------------------------------------
+// FIELDSET
+//------------------------------------------------------------------------------
 struct fieldset
 {
     const boost::any& get(uint64_t key) const
@@ -177,15 +180,101 @@ struct fieldset
     std::unordered_map<uint64_t, boost::any> _fields;
 };
 
+
+//------------------------------------------------------------------------------
+// HELL BEGINS (BOX BINDINGS OVER FIELDSET)
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+struct binding_base
+{
+    fieldset* __box;
+};
+
+//------------------------------------------------------------------------------
+struct binding_end
+{
+    struct{} __dummy;
+};
+
+//------------------------------------------------------------------------------
+// tells how many fields there are in the binding type
+// gotta blaze them straight in the face if ther are more than 256
+// as indexing would wrap over and fail then
+template<typename A, typename F>
+constexpr ptrdiff_t span()
+{
+    A a;
+    auto ptr_end = &binding_end::__dummy;
+    auto ptr_beacon = &binding_base::__box;
+    auto ptr_b = reinterpret_cast<const uint8_t*>(&(a.*ptr_end));
+    auto ptr_c = reinterpret_cast<const uint8_t*>(&(a.*ptr_beacon));
+    auto align_beacon = alignof(decltype(binding_base::__box));
+    auto align_field = alignof(F);
+    auto align = (align_beacon < align_field) ? align_field : align_beacon;
+    return (ptr_b - ptr_c - align) / sizeof(F);
+}
+
+//------------------------------------------------------------------------------
+// small helper which gets latched onto the inheritance sequence last
+template<typename Acc>
+struct finish_helper_t: Acc, binding_end {
+    finish_helper_t(fieldset& fs)
+    {
+        this->__box = &fs;
+    }
+
+    finish_helper_t()
+    {
+        this->__box = nullptr;
+    }
+};
+
+//------------------------------------------------------------------------------
+// just a little hardcore TMP crap, minding its own business, mending a primus
+template<typename Acc, template<typename Base> class First, template<typename Base> class... Args>
+struct box_binding_helper
+{
+    using type = typename box_binding_helper<First<Acc>, Args...>::type;
+};
+
+//------------------------------------------------------------------------------
+// go on, nothing of note here, just latching the last piece over the heap
+template<typename Acc, template<typename Base> class First>
+struct box_binding_helper<Acc, First>
+{
+    using type = finish_helper_t<First<Acc>>;
+};
+
+//------------------------------------------------------------------------------
+// this one pieces them all together
+// kinda redundant, might as well do the same in the following typedef
+template< template<typename Base> class... Parts>
+struct box_binding
+{
+    using type = typename box_binding_helper<binding_base, Parts...>::type;
+};
+
+//------------------------------------------------------------------------------
+// define a box binding out of parts
+template< template<typename Base> class... Parts>
+using box_binding_t = typename box_binding<Parts...>::type;
+
+//------------------------------------------------------------------------------
+// this is the one way to get this into a member, along with the name
 struct property_initializer
 {
-    fieldset* host;
+    fieldset** host;
     const char* name;
 };
 
+//------------------------------------------------------------------------------
+// base class, contains and index and some static name<->hash mapping
 struct property_base
 {
     using mapping_t = std::unordered_map<uint64_t, std::string>;
+
+    uint8_t index = 0;
 
     static mapping_t& mapping()
     {
@@ -199,8 +288,24 @@ struct property_base
         mapping()[key] = name;
         return key;
     }
+
+    fieldset* __get_target()
+    {
+        auto raw_ptr = reinterpret_cast<uint8_t*>(this);
+        auto target_ptr = raw_ptr - index - sizeof(void*);
+        auto result = reinterpret_cast<fieldset**>(target_ptr);
+        return *result;
+    }
+
+    const fieldset* __get_target() const
+    {
+        return const_cast<property_base*>(this)->__get_target();
+    }
 };
 
+//------------------------------------------------------------------------------
+// this one actually adds a name and registers the hash
+// its only raison d'etre is binding name to a hash in the name mapping
 template<uint64_t Hash>
 struct named_property: public property_base
 {
@@ -210,68 +315,260 @@ struct named_property: public property_base
     }
 };
 
+//------------------------------------------------------------------------------
+// this is kinda obsolete, skip further
 template<typename Value, uint64_t Hash>
 struct mapped_property: public named_property<Hash>
 {
-    mapped_property(property_initializer&& init): named_property<Hash>(init.name), _host(*init.host)
+    mapped_property(property_initializer&& init): named_property<Hash>(init.name)
     {
+        auto raw_ptr = reinterpret_cast<uint8_t*>(this);
+        auto begin_ptr = reinterpret_cast<uint8_t*>(init.host) + sizeof(void*);
+        auto diff = raw_ptr - begin_ptr;
+        this->index = diff;
     }
 
     mapped_property<Value, Hash>& operator=(const Value& val)
     {
-        _host.set(Hash, val);
+
+        this->__get_target()->set(Hash, val);
         return *this;
     }
 
     operator const Value&() const
     {
-        return boost::any_cast<const Value&>(_host.get(Hash));
+        return boost::any_cast<const Value&>(this->__get_target()->get(Hash));
     }
 
     operator Value&()
     {
-        return boost::any_cast<Value&>(_host.get(Hash));
+        return boost::any_cast<Value&>(this->__get_target()->get(Hash));
     }
 
-    fieldset& _host;
+
 };
 
-template<typename T>
-using clean_type_t = std::remove_pointer_t<T>;
-
-#define BLACK_MAGICK(Prop, Type) mapped_property<Type, #Prop ## _crc64> Prop = std::move(property_initializer{this, #Prop})
-
-struct atom_test: public fieldset
+//------------------------------------------------------------------------------
+// now that's the real meat -- field binding
+// it does some ugly shit pointer magic inside to get to the fieldset
+// while only keeping an unsigned byte inside, using it as an index to infer offset
+// to the fieldset pointer somewhere at the bottom of the binding type
+template<typename ReadSpec, uint64_t Hash>
+struct read_mapped_property: public named_property<Hash>
 {
-    BLACK_MAGICK(size, uint32_t);
-    BLACK_MAGICK(type, uint32_t);
-    BLACK_MAGICK(handler_type, uint64_t);
+    using value_type = typename ReadSpec::value_type;
+
+    read_mapped_property(property_initializer&& init): named_property<Hash>(init.name)
+    {
+        auto raw_ptr = reinterpret_cast<uint8_t*>(this);
+        auto begin_ptr = reinterpret_cast<uint8_t*>(init.host) + sizeof(void*);
+        auto diff = raw_ptr - begin_ptr;
+        this->index = diff;
+    }
+
+    read_mapped_property<ReadSpec, Hash>& operator=(const value_type& val)
+    {
+        this->__get_target()->set(Hash, val);
+        return *this;
+    }
+
+    operator const value_type&() const
+    {
+        return boost::any_cast<const value_type&>(this->__get_target()->get(Hash));
+    }
+
+    operator value_type&()
+    {
+        return boost::any_cast<value_type&>(this->__get_target()->get(Hash));
+    }
+
+    // read the field from bitreader
+    template<typename Reader>
+    void operator<<(Reader& r)
+    {
+        *this = ReadSpec::template read<Reader>(r);
+    }
+
+    // sometimes operator value_type&() ain't enough to hint the compiler
+    value_type& operator()()
+    {
+        return *this;
+    }
+
+    const value_type& operator()() const
+    {
+        return *this;
+    }
 };
 
-struct atom_test2: public fieldset
+//------------------------------------------------------------------------------
+// SOME LIVID TMP TO ENABLE A COUPLE OF BASIC READSPECS FOR PROPERTIES
+//------------------------------------------------------------------------------
+namespace meta
+{
+    template<typename T> struct id_t { using type = T; };
+
+    template<bool Cond, typename Then, typename Else>
+    struct if_t
+    {
+    };
+
+    template<typename Then, typename Else>
+    struct if_t<true, Then, Else>
+    {
+        using type = Then;
+    };
+
+    template<typename Then, typename Else>
+    struct if_t<false, Then, Else>
+    {
+        using type = Else;
+    };
+
+    template<size_t Bits, typename First, typename... Types>
+    struct pick_type
+    {
+        using type = typename if_t<Bits <= sizeof(First)*8, First,
+            typename pick_type<Bits, Types...>::type>::type;
+    };
+
+    template<size_t Bits, typename First>
+    struct pick_type<Bits, First>
+    {
+        static_assert(Bits <= sizeof(First)*8, "No suitable type found for reading so many bits!");
+        using type = First;
+    };
+}
+
+template<size_t Bits>
+using uint_type_t = typename meta::pick_type<Bits, uint8_t, uint16_t, uint32_t, uint64_t>::type;
+
+template<size_t Bits>
+using int_type_t = typename meta::pick_type<Bits, int8_t, int16_t, int32_t, int64_t>::type;
+
+
+template<template<size_t> class Picker, size_t Bits>
+struct read_spec {
+    using value_type = Picker<Bits>;
+
+    template<typename Reader>
+    static value_type read(Reader& r)
+    {
+        return r.template read<value_type>(Bits);
+    }
+};
+
+template<size_t bits> using r_uint = read_spec<uint_type_t, bits>;
+template<size_t bits> using r_bit = r_uint<bits>;
+template<size_t bits> using r_int = read_spec<int_type_t, bits>;
+
+template<size_t Size, typename ReadSpec>
+struct r_array {
+    using element_type = typename ReadSpec::value_type;
+    using value_type = std::vector<element_type>;
+
+    template<typename Reader>
+    static value_type read(Reader& r)
+    {
+        value_type ret;
+        for (size_t iter = 0; iter < Size; ++iter) {
+            ret.push_back(ReadSpec::template read(r));
+        }
+        return ret;
+    }
+};
+
+
+#define BLACK_MAGICK(Prop, Type) mapped_property<Type, #Prop ## _crc64> Prop = property_initializer{&this->__box, #Prop}
+#define MUCH_BLACKER_MAGICK(Prop, ...) read_mapped_property<__VA_ARGS__, #Prop ## _crc64> Prop = property_initializer{&this->__box, #Prop}
+
+template<typename Base>
+struct atom_test: Base
+{
+    MUCH_BLACKER_MAGICK(size, r_uint<32>);
+    MUCH_BLACKER_MAGICK(type, r_int<27>);
+    MUCH_BLACKER_MAGICK(handler_type, r_uint<64>);
+    MUCH_BLACKER_MAGICK(reserved_1, r_array<6, r_uint<16>>);
+};
+
+template<typename Base>
+struct atom_test2: public Base
 {
     BLACK_MAGICK(size, uint8_t);
     BLACK_MAGICK(type, uint16_t);
     BLACK_MAGICK(handler_type, double_t);
 };
 
+template<typename Base>
+struct Box: public Base
+{
+    MUCH_BLACKER_MAGICK(size, r_uint<32>);
+    MUCH_BLACKER_MAGICK(type, r_uint<32>);
+};
+
+template<typename Base>
+struct FileTypeBox: public Base
+{
+    MUCH_BLACKER_MAGICK(major_brand, r_uint<32>);
+    MUCH_BLACKER_MAGICK(minor_version, r_uint<32>);
+    MUCH_BLACKER_MAGICK(compatible_brands, r_array<3, r_uint<32>>);
+};
+
+using atom_test_t = box_binding_t<atom_test>;
+using atom_test2_t = box_binding_t<atom_test2>;
+
+using ftyp_test_t = box_binding_t<Box, FileTypeBox>;
+
 uint64_t test_it() {
-    atom_test test;
-    atom_test2 test2;
-    static const size_t test_size = sizeof(atom_test);
+    fieldset box1;
+    fieldset box2;
+    atom_test_t test{box1};
+    atom_test2_t test2{box2};
+    static const size_t test_size = sizeof(atom_test_t);
     test.size = 125;
     const double shit_pi = 3.1415926;
     test2.handler_type = shit_pi;
     std::cout << "test field: " << (test.size) << std::endl;
     std::cout << "atom size: " << sizeof(test) << std::endl;
     std::cout << "test2.handler_type*2 = " << test2.handler_type*2 << ", expected is " << shit_pi*2 << std::endl;
+    std::cout << "span(atom_test_t) = " << span<atom_test_t, uint8_t>() << std::endl;
+    std::cout << "span(atom_test2_t) = " << span<atom_test2_t, uint8_t>() << std::endl;
+    auto sp = span<ftyp_test_t, uint8_t>();
+    std::cout << "span(ftyp_test_t) = " << sp << std::endl;
     return test.size + test_size;
 }
 
+struct reader_dummy {
+    template<typename T>
+    T read(size_t bits)
+    {
+        ++counter;
+        return static_cast<T>(counter + bits);
+    }
 
+    size_t counter = 0;
+};
+
+void read_test() {
+    fieldset box;
+    atom_test_t test{box};
+
+    reader_dummy reader;
+    test.size << reader;
+    test.type << reader;
+    test.handler_type << reader;
+    test.reserved_1 << reader;
+    std::cout << "test.size = " << test.size << ", expected 32+1=33" <<  std::endl;
+    std::cout << "test.type = " << test.type << ", expected 27+2=29" << std::endl;
+    std::cout << "test.handler_type = " << test.handler_type << ", expected 64+3=67" << std::endl;
+    for (const auto& x: test.reserved_1()) {
+        std::cout << "test.reserved_1[] == " << x << ", expected 16+4 and upwards" << std::endl;
+    }
+}
 
 int main() {
     std::cout << "Hello, World!" << std::endl;
     test_it();
+    read_test();
     return 0;
 }
